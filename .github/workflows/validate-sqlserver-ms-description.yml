@@ -1,0 +1,284 @@
+# TEMPORARY validation workflow for issue #18500.
+#
+# Delete this file before opening a pull request against metabase/metabase.
+# It is not part of the driver change. It exists so a public fork can run the
+# SQL Server description tests on a GitHub-hosted linux/amd64 runner.
+#
+# The official job is be-tests-sqlserver in .github/workflows/drivers.yml.
+# That file is workflow_call only, selects runners with vars.DEFAULT_RUNNER_KEY,
+# and goes through .github/actions/test-driver, which uses the EE aliases,
+# the :ci heap of 12g, ci-conductor, and the quarantine gate. None of that is
+# available on a personal fork. ubuntu-latest has 7 GB of RAM, so this workflow
+# keeps the same SQL Server 2022 image and the same test credentials, installs
+# Java and Clojure through prepare-backend, and does not use the :ci alias.
+name: Validate SQL Server MS_Description
+
+on:
+  push:
+    branches:
+      - validate/sqlserver-ms-description
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: validate-sqlserver-ms-description-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sqlserver-2022:
+    name: SQL Server 2022 MS_Description
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      # Unset, the test runner falls back to H2 and mt/test-driver :sqlserver
+      # returns without running the body. The assertion check below treats that
+      # as a failure even if Clojure exits 0.
+      DRIVERS: sqlserver
+      MB_SQLSERVER_TEST_HOST: localhost
+      MB_SQLSERVER_TEST_PORT: "1433"
+      MB_SQLSERVER_TEST_USER: SA
+      # Public fixture password already committed in drivers.yml and in
+      # modules/drivers/sqlserver/test/metabase/test/data/sqlserver.clj.
+      MB_SQLSERVER_TEST_PASSWORD: "P@ssw0rd"
+      # :ci would add -Xmx12g, which does not fit this runner once SQL Server
+      # has reserved its memory. JAVA_TOOL_OPTIONS applies because the :ci
+      # alias is not on the command line.
+      JAVA_TOOL_OPTIONS: "-Xmx3g -Xms512m"
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        ports:
+          - "1433:1433"
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: "P@ssw0rd"
+          SA_PASSWORD: "P@ssw0rd"
+          MSSQL_MEMORY_LIMIT_MB: "1024"
+    steps:
+      - name: Free disk on the hosted runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Prepare back-end environment
+        uses: ./.github/actions/prepare-backend
+
+      - name: Wait until SQL Server accepts a login
+        run: |
+          set -u
+          echo "Containers:"
+          docker ps -a --format 'table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}\t{{.Ports}}'
+          cid="$(docker ps -q --filter ancestor=mcr.microsoft.com/mssql/server:2022-latest | head -n 1)"
+          if [ -z "$cid" ]; then
+            echo "::error::SQL Server service container is not running"
+            docker ps -a
+            exit 1
+          fi
+          echo "Waiting on container $cid"
+          ready=0
+          for attempt in $(seq 1 60); do
+            if docker exec -e "SQLCMDPASSWORD=${MB_SQLSERVER_TEST_PASSWORD}" "$cid" bash -c '
+              if [ -x /opt/mssql-tools18/bin/sqlcmd ]; then
+                cmd=/opt/mssql-tools18/bin/sqlcmd
+                extra=-C
+              elif [ -x /opt/mssql-tools/bin/sqlcmd ]; then
+                cmd=/opt/mssql-tools/bin/sqlcmd
+                extra=
+              else
+                echo "sqlcmd not found in the SQL Server image" >&2
+                exit 1
+              fi
+              "$cmd" -S localhost -U SA -P "$SQLCMDPASSWORD" $extra -Q "SELECT @@VERSION" -b
+            '; then
+              ready=1
+              break
+            fi
+            echo "SQL Server not ready (attempt $attempt/60)"
+            sleep 5
+          done
+          if [ "$ready" != 1 ]; then
+            echo "::error::SQL Server did not accept a login within 5 minutes"
+            docker logs "$cid" | tail -n 200
+            exit 1
+          fi
+
+      - name: Run the MS_Description tests against SQL Server
+        id: tests
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          echo "DRIVERS=$DRIVERS"
+          echo "MB_SQLSERVER_TEST_HOST=$MB_SQLSERVER_TEST_HOST"
+          clojure --version
+          clojure -X:dev:drivers:drivers-dev:test \
+            ':multithread?' false \
+            :only '[
+              metabase.driver.sqlserver-test/ms-description-sql-test
+              metabase.driver.sqlserver-test/ms-description-metadata-merge-test
+              metabase.driver.sqlserver-test/extended-property-comment-sql-test
+              metabase.driver.sqlserver-test/ms-description-sync-test
+              metabase.driver.sqlserver-test/user-defined-type-alias-sync-test
+              metabase.sync.sync-metadata.comments-test/basic-field-comments-test
+              metabase.sync.sync-metadata.comments-test/comment-should-not-overwrite-custom-description-test
+              metabase.sync.sync-metadata.comments-test/sync-comment-on-existing-field-test
+              metabase.sync.sync-metadata.comments-test/table-comments-test
+              metabase.sync.sync-metadata.comments-test/dont-overwrite-table-custom-description-test
+              metabase.sync.sync-metadata.comments-test/sync-existing-table-comment-test
+            ]' \
+            2>&1 | tee target/sqlserver-validation.log
+
+      - name: Require the SQL Server bodies to have run
+        if: steps.tests.outcome == 'success'
+        run: |
+          set -eu
+          cid="$(docker ps -q --filter ancestor=mcr.microsoft.com/mssql/server:2022-latest | head -n 1)"
+          if [ -z "$cid" ]; then
+            echo "::error::SQL Server container is gone, so the catalog check cannot run"
+            exit 1
+          fi
+          docker exec -e "SQLCMDPASSWORD=${MB_SQLSERVER_TEST_PASSWORD}" "$cid" bash -c '
+            if [ -x /opt/mssql-tools18/bin/sqlcmd ]; then
+              cmd=/opt/mssql-tools18/bin/sqlcmd
+              extra=-C
+            else
+              cmd=/opt/mssql-tools/bin/sqlcmd
+              extra=
+            fi
+            "$cmd" -S localhost -U SA -P "$SQLCMDPASSWORD" $extra -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.databases ORDER BY name;" -b
+          ' > target/sqlserver-databases.txt
+          python3 -c 'import textwrap; exec(textwrap.dedent("""
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # Unit tests have no DRIVERS gate. The integration and comments tests do:
+          # mt/test-driver returns immediately when :sqlserver is not in DRIVERS, and
+          # the deftest still passes. Hawk 1.0.19 writes assertions="0" in that case
+          # (mb.hawk.junit begins every var at assertion-count 0). A missing attribute
+          # is not the same thing: this checker does not treat it as a skip.
+          unit_tests = {
+              "ms-description-sql-test",
+              "ms-description-metadata-merge-test",
+              "extended-property-comment-sql-test",
+          }
+          # Databases left behind when the body actually connects. The last comments
+          # test builds its database name at random, so it has no stable row here.
+          database_evidence = {
+              "ms-description-sync-test": "ms_description_sync_test",
+              "user-defined-type-alias-sync-test": "udt_alias_test",
+              "basic-field-comments-test": "basic-field-comments",
+              "comment-should-not-overwrite-custom-description-test": "update-desc",
+              "sync-comment-on-existing-field-test": "comment-after-sync",
+              "table-comments-test": "table_with_comment_db",
+              "dont-overwrite-table-custom-description-test": "table_with_updated_desc_db",
+          }
+          random_database_test = "sync-existing-table-comment-test"
+          required = list(unit_tests) + list(database_evidence) + [random_database_test]
+
+          files = list(pathlib.Path("target/junit").rglob("*.xml"))
+          if not files:
+              sys.exit("target/junit has no XML. The runner did not record test results.")
+          found = {}
+          for path in files:
+              for case in ET.parse(path).getroot().iter("testcase"):
+                  name = case.get("name")
+                  if name not in required:
+                      continue
+                  raw = case.get("assertions")
+                  if raw is None:
+                      count = None
+                  else:
+                      try:
+                          count = int(raw)
+                      except ValueError:
+                          sys.exit(f"{name} has a non-numeric assertions attribute: {raw!r}")
+                  found[name] = {
+                      "assertions": count,
+                      "failed": case.find("failure") is not None or case.find("error") is not None,
+                  }
+          databases = {
+              line.strip()
+              for line in pathlib.Path("target/sqlserver-databases.txt").read_text().splitlines()
+              if line.strip() and not line.startswith("(")
+          }
+          print("SQL Server databases:")
+          for name in sorted(databases):
+              print(f"  {name}")
+          print(f"JUnit files: {len(files)}")
+          problems = []
+          for name in required:
+              row = found.get(name)
+              if row is None:
+                  print(f"  {name}: MISSING")
+                  problems.append(f"{name} was not recorded")
+                  continue
+              count = row["assertions"]
+              db_name = database_evidence.get(name)
+              db_present = db_name in databases if db_name else None
+              shown = "absent" if count is None else count
+              detail = ""
+              if db_name:
+                  detail = f" database={db_name}:{db_present}"
+              if row["failed"]:
+                  detail += " failed-in-xml"
+              print(f"  {name}: assertions={shown}{detail}")
+              if row["failed"]:
+                  problems.append(f"{name} recorded a failure or error")
+                  continue
+              if count == 0:
+                  problems.append(
+                      f"{name} recorded assertions=0, so its body did not run "
+                      "(DRIVERS did not select sqlserver, or the driver gate returned early)"
+                  )
+                  continue
+              if count is not None and count > 0:
+                  continue
+              if name in unit_tests:
+                  continue
+              if db_present:
+                  continue
+              if name == random_database_test:
+                  problems.append(
+                      f"{name} has no assertions attribute and its database name is random, "
+                      "so a skip cannot be distinguished from a pass"
+                  )
+              else:
+                  problems.append(
+                      f"{name} has no assertions attribute and {db_name} is not on the server"
+                  )
+          if problems:
+              print("Not accepted as a SQL Server run:")
+              for problem in problems:
+                  print(f"  - {problem}")
+              sys.exit(1)
+          """))'
+
+      - name: SQL Server container log
+        if: failure()
+        run: |
+          set +e
+          docker ps -a --format 'table {{.ID}}\t{{.Image}}\t{{.Status}}\t{{.Names}}'
+          cid="$(docker ps -aq --filter ancestor=mcr.microsoft.com/mssql/server:2022-latest | head -n 1)"
+          if [ -n "$cid" ]; then
+            docker logs "$cid" | tail -n 200
+          fi
+
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sqlserver-ms-description-logs
+          path: |
+            target/sqlserver-validation.log
+            target/sqlserver-databases.txt
+            target/junit/**/*.xml
+          if-no-files-found: warn
+          retention-days: 7
